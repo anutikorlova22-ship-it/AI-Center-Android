@@ -1,0 +1,102 @@
+name: Repair and build AI Center APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repair-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Unpack source archive safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, zipfile
+          root=pathlib.Path.cwd().resolve()
+          archive=root/'AI-Center-Android-source.zip'
+          if not archive.is_file():
+              print('No ZIP: using already extracted sources')
+          else:
+              with zipfile.ZipFile(archive) as z:
+                  for info in z.infolist():
+                      if info.is_dir():
+                          continue
+                      target=(root/info.filename).resolve()
+                      if not target.is_relative_to(root) or info.filename.startswith('/'):
+                          raise SystemExit('Unsafe archive entry: '+info.filename)
+                      if info.file_size>20_000_000:
+                          raise SystemExit('Oversized archive entry: '+info.filename)
+                      target.parent.mkdir(parents=True,exist_ok=True)
+                      target.write_bytes(z.read(info))
+              print('Archive extracted')
+          PY
+
+      - name: Locate Android project and fix nested dialog lambdas
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, os
+          roots=list(pathlib.Path('.').rglob('settings.gradle.kts'))+list(pathlib.Path('.').rglob('settings.gradle'))
+          roots=[p for p in roots if '.gradle' not in p.parts and 'build' not in p.parts]
+          if len(roots)!=1:
+              raise SystemExit('Expected exactly one Gradle project; found: '+repr([str(p) for p in roots]))
+          project=roots[0].parent.resolve()
+          java=project/'app/src/main/java/ru/aicenter/mobile/MainActivity.java'
+          if not java.is_file():
+              raise SystemExit('MainActivity.java missing at '+str(java))
+          s=java.read_text(encoding='utf-8')
+          # Only rename the nested result-dialog callback parameters.
+          old1='.setMessage(result).setPositiveButton("Закрыть",(d,w)->{})'
+          new1='.setMessage(result).setPositiveButton("Закрыть",(closeDialog,closeWhich)->{})'
+          old2='.setNeutralButton("Поделиться",(d,w)->{'
+          new2='.setNeutralButton("Поделиться",(shareDialog,shareWhich)->{'
+          if old1 in s: s=s.replace(old1,new1,1)
+          if old2 in s: s=s.replace(old2,new2,1)
+          java.write_text(s,encoding='utf-8')
+          with open(os.environ['GITHUB_ENV'],'a') as env:
+              env.write('ANDROID_PROJECT='+str(project)+'\n')
+          print('Android project:',project)
+          PY
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ANDROID_PROJECT"
+          gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Center-Android-debug-APK
+          path: '**/build/outputs/apk/debug/*.apk'
+          if-no-files-found: error
+          retention-days: 14
